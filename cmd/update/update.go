@@ -5,11 +5,11 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"log"
-	"wgcf/cloudflare/api"
-	"wgcf/cloudflare/structs/resp"
-	. "wgcf/cmd/util"
+	"wgcf/cloudflare"
+	. "wgcf/cmd/shared"
 	"wgcf/config"
 	"wgcf/util"
+	"wgcf/wireguard"
 )
 
 var deviceName string
@@ -21,8 +21,7 @@ var Cmd = &cobra.Command{
 	Short: shortMsg,
 	Long: FormatMessage(shortMsg, `
 If a new/different license key is provided, the current device will be bound to the new key and its parent account. 
-Please note that there is a maximum limit of 5 active devices linked to the same account at a given time.
-Will change various account settings to ensure WireGuard connection will succeed.`),
+Please note that there is a maximum limit of 5 active devices linked to the same account at a given time.`),
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := updateAccount(); err != nil {
 			log.Fatal(util.GetErrorMessage(err))
@@ -35,66 +34,82 @@ func init() {
 }
 
 func updateAccount() error {
-	if !ValidAccount() {
+	if !IsConfigValidAccount() {
 		return errors.New("no account detected")
 	}
 
 	ctx := CreateContext()
-	deviceData, err := api.GetDeviceData(ctx)
+	thisDevice, err := cloudflare.GetSourceDevice(ctx)
 	if err != nil {
 		return err
 	}
-	boundDevice, err := api.GetBoundDevice(ctx)
+	_, thisDevice, err = ensureLicenseKeyUpToDate(ctx, thisDevice)
 	if err != nil {
 		return err
 	}
 
-	if err := ensureLicenseKeyUpdated(ctx, deviceData, boundDevice); err != nil {
+	boundDevice, err := cloudflare.GetSourceBoundDevice(ctx)
+	if err != nil {
 		return err
 	}
-	if err := EnsureDeviceActive(ctx, boundDevice); err != nil {
-		return err
+	if boundDevice.Name == "" || (deviceName != "" && deviceName != boundDevice.Name) {
+		log.Println("Setting device name")
+		if _, err := SetDeviceName(ctx, deviceName); err != nil {
+			return err
+		}
 	}
 
-	PrintDeviceData(deviceData, boundDevice)
+	boundDevice, err = cloudflare.UpdateSourceBoundDeviceActive(ctx, true)
+	if err != nil {
+		return err
+	}
+	if !boundDevice.Active {
+		return errors.New("failed activating device")
+	}
+
+	PrintDeviceData(thisDevice, boundDevice)
 	log.Println("Successfully updated Cloudflare Warp account")
 	return nil
 }
 
-// modifies device pointers if updated
-func ensureLicenseKeyUpdated(ctx *config.Context, deviceData *resp.DeviceData, device *resp.BoundDevice) error {
-	if deviceData.Account.LicenseKey != ctx.LicenseKey {
+func ensureLicenseKeyUpToDate(ctx *config.Context, thisDevice *cloudflare.Device) (*cloudflare.Account, *cloudflare.Device, error) {
+	if thisDevice.Account.License != ctx.LicenseKey {
 		log.Println("Updated license key detected, re-binding device to new account")
-		if _, err := updateLicenseKey(ctx); err != nil {
-			return err
-		}
-		if _, err := SetDeviceName(ctx, deviceName); err != nil {
-			return err
-		}
-		// make sure new license key is synced with config file if it came from other stream (e.g. env variable)
-		if err := viper.WriteConfig(); err != nil {
-			return err
-		}
-
-		newDeviceData, err := api.GetDeviceData(ctx)
-		if err != nil {
-			return err
-		}
-		newBoundDevice, err := api.GetBoundDevice(ctx)
-		if err != nil {
-			return err
-		}
-		*deviceData = *newDeviceData
-		*device = *newBoundDevice
+		return updateLicenseKey(ctx)
 	}
-	return nil
+	return nil, thisDevice, nil
 }
 
-func updateLicenseKey(ctx *config.Context) (*resp.UpdateLicenseData, error) {
-	accountData, err := api.UpdateLicenseKey(ctx)
+func updateLicenseKey(ctx *config.Context) (*cloudflare.Account, *cloudflare.Device, error) {
+	newPrivateKey, err := wireguard.NewPrivateKey()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	//TODO: Check if key actually updated
-	return accountData, nil
+	newPublicKey := newPrivateKey.Public()
+	if _, _, err := cloudflare.UpdateLicenseKey(ctx, newPublicKey.String()); err != nil {
+		return nil, nil, err
+	}
+
+	viper.Set(config.PrivateKey, newPrivateKey.String())
+	if err := viper.WriteConfig(); err != nil {
+		return nil, nil, err
+	}
+
+	account, err := cloudflare.GetAccount(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	thisDevice, err := cloudflare.GetSourceDevice(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if account.License != ctx.LicenseKey {
+		return nil, nil, errors.New("failed to update license key")
+	}
+	if thisDevice.Key != newPublicKey.String() {
+		return nil, nil, errors.New("failed to update public key")
+	}
+
+	return account, thisDevice, nil
 }
